@@ -69,3 +69,14 @@ docs/guides/VOICE.md
 # 语音库（用户个人音频素材，config.json 的 socialV2.voice.dir 指向此处）
 audio/
 
+# B站登录 cookie
+sing/cookies.txt
+
+# sing/ 运行时产物与依赖（模型权重、venv、pip 安装包、实验音频）
+sing/venv/
+sing/model/
+sing/rvc/
+sing/rvc_cli/
+sing/work/
+
+venv/

@@ -69,6 +69,15 @@ console.log('## sticker-lib 纯函数');
   ok(q.matched === 1 && q.stickers[0].id === 'b', 'formatStickerList 按备注搜索');
   const q2 = formatStickerList(list, '无语', 10);
   ok(q2.matched === 1 && q2.stickers[0].id === 'c', 'formatStickerList 按本地笔记搜索');
+  // 分页：offset 切片、truncated 只在后面还有时为 true、越界收敛为空页
+  const p1 = formatStickerList(list, '', 2, 0);
+  ok(p1.stickers.length === 2 && p1.offset === 0 && p1.truncated === true && p1.stickers[0].id === 'a', 'formatStickerList 第一页');
+  const p2 = formatStickerList(list, '', 2, 2);
+  ok(p2.stickers.length === 1 && p2.offset === 2 && p2.truncated === false && p2.stickers[0].id === 'c', 'formatStickerList 第二页（最后一页）');
+  const p3 = formatStickerList(list, '', 2, 99);
+  ok(p3.stickers.length === 0 && p3.truncated === false, 'formatStickerList offset 越界返回空页');
+  const p0 = formatStickerList(list, '', 2);
+  ok(p0.offset === 0 && p0.stickers.length === 2, 'formatStickerList 默认 offset=0');
   const ctx = buildStickerContext(list, 8);
   ok(ctx.includes('笑死') && ctx.includes('生气'), 'buildStickerContext 包含备注');
   ok(buildStickerStrategyHint().includes('qq_send_sticker'), '策略提示包含发送工具');
@@ -122,6 +131,36 @@ console.log('## bridge 路由/函数存在性');
   for (const s of ['/api/socialV2/sticker-list', '/api/socialV2/sticker-image', '/api/socialV2/sticker-note', '/api/socialV2/send-sticker', '/api/socialV2/sticker-remark', '/api/stickers', 'syncStickerLibrary', 'sendStickerV2']) {
     ok(bridge.includes(s), `bridge 包含 ${s}`);
   }
+}
+
+// 删除表情自动批准：默认关、有每日配额、控制台与 QQ 命令都能改。
+console.log('## 删除审批自动批准');
+{
+  const bridge = fs.readFileSync(path.join(ROOT, 'src', 'bridge.js'), 'utf8');
+  ok(/deleteApprove:\s*\{\s*\n\s*auto:\s*false/.test(bridge), 'bridge 默认 auto=false（不自动删）');
+  ok(bridge.includes('function autoApproveBudget()'), 'bridge 有每日配额函数');
+  ok(bridge.includes('autoApproved: r.autoApproved === true'), '接口回传 autoApproved 字段');
+  ok(bridge.includes("plainContent === '/stickerauto'"), 'bridge 支持 /stickerauto 管理命令');
+  const mcp = fs.readFileSync(path.join(ROOT, 'src', 'mcp-snowluma-safe.js'), 'utf8');
+  ok(mcp.includes('autoApproved=true 表示管理员已开启自动批准'), 'qq_delete_sticker 描述告知 AI 自动批准语义');
+  const html = fs.readFileSync(path.join(ROOT, 'public', 'console.html'), 'utf8');
+  ok(html.includes('id="v2StickerDeleteAuto"') && html.includes('id="v2StickerDeleteAutoLimit"'), '控制台有自动批准开关与每日上限输入框');
+  ok((html.match(/v2StickerDeleteAutoLimit/g) || []).length >= 3, '控制台 load/save 都接上了自动批准控件');
+}
+
+// 批量删除：一次调用传 id 数组，桥接只出一张审批卡，管理员一次 /approve 全删。
+console.log('## 删除表情批量接口');
+{
+  const bridge = fs.readFileSync(path.join(ROOT, 'src', 'bridge.js'), 'utf8');
+  ok(bridge.includes('Array.isArray(body.stickerIds)'), '端点接受 stickerIds 数组');
+  ok(bridge.includes("Array.isArray(stickerIds) ? stickerIds : [stickerIds]"), '单张 stickerId 写法仍兼容');
+  ok(bridge.includes('一次最多删除 50 张'), '批量上限 50 张');
+  ok(bridge.includes('function describeDeleteItems('), '审批卡/结果用统一的批量描述');
+  ok(bridge.includes('items: [{ stickerId, desc }]'), '审批单承载批次 items');
+  ok(!/stickerDeleteApprovals\.set\(approvalId, \{ key, stickerId/.test(bridge), '审批单不再是一单一表情');
+  const mcp = fs.readFileSync(path.join(ROOT, 'src', 'mcp-snowluma-safe.js'), 'utf8');
+  ok(mcp.includes('stickerIds: z.array(z.string()).min(1).max(50)'), 'qq_delete_sticker 接受 id 数组（1-50）');
+  ok(mcp.includes('不要一张一张调用'), '工具描述引导 AI 一次批量提交');
 }
 
 if (process.env.QQ_BRIDGE_TEST_LIVE === '1') {

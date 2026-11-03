@@ -1,0 +1,21 @@
+﻿# 大肥鱼唱歌技能 Python 依赖（Python 3.10~3.12，Windows）
+--extra-index-url https://download.pytorch.org/whl/cu128
+# cu128 版 torch：RTX 50 系（sm_120）必须用，cu121 没有该算力算子会退回 CPU 跑（极慢）。
+torch==2.7.1+cu128
+torchaudio==2.7.1+cu128
+transformers==4.46.3
+demucs==4.1.0
+faiss-cpu==1.15.1
+librosa==1.0.0
+safetensors==0.8.0
+pedalboard==0.9.26
+noisereduce==3.0.3
+stftpitchshift==2.0
+torchcrepe==0.0.24
+local-attention==1.11.2
+beautifulsoup4==4.15.0
+pydub==0.25.1
+numpy==2.5.4
+soundfile
+scipy
+einops

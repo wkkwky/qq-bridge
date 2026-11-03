@@ -381,6 +381,7 @@ const TOOL_CONFIG_FLAGS = {
   qq_get_self_image: 'getSelfImage',
   qq_sticker_note: 'stickerNote',
   qq_set_sticker_remark: 'setStickerRemark',
+  qq_delete_sticker: 'deleteSticker',
 };
 const disabledTools = [];
 // 别名必须同时出现在 schema 与规范化入口中，否则 Zod 会先把它丢弃。
@@ -441,6 +442,24 @@ function normalizeWakeArguments(config) {
       disabledTools.push(`${name}(${flag})`);
       return undefined;
     }
+    // token 软必填：deepseek-flash 这类小模型偶发漏传 token，zod 必填会在 MCP 校验层
+    // 硬拒（-32602 invalid JSON 级报错），模型拿到的反馈不含补救指引。改为 schema 标可选、
+    // 处理器内软拒并明确告诉它怎么改——模型读到后带 token 原样重试一次即可恢复。
+    // 安全不变：桥接侧照样校验 x-agent-token 与会话绑定，软拒只是把"拒绝"提前说人话。
+    // 放在会话绑定闸门之前：token 软拒先拦住，再轮到 SELF_KEY 校验。
+    const schema = rest.length >= 2 ? rest[rest.length - 2] : undefined;
+    let handler = rest[rest.length - 1];
+    if (schema?.token && typeof schema.token.isOptional === 'function' && !schema.token.isOptional()) {
+      const desc = schema.token.description;
+      schema.token = desc ? z.string().optional().describe(desc) : z.string().optional();
+      const originalHandler = handler;
+      handler = async (args, extra) => {
+        if (typeof args?.token !== 'string' || args.token === '') {
+          return { content: [{ type: 'text', text: '缺少会话令牌：本次调用必须携带 token 参数，值就是唤醒提示中【会话令牌】给出的那串字符。请原样补上 token 参数后立刻重试本次调用。' }], isError: true };
+        }
+        return originalHandler(args, extra);
+      };
+    }
     // ── 会话绑定闸门（SELF_KEY）──────────────────────────────────────────────
     //
     // 在**统一注册点**包一层，而不是逐个改 31 个带 key 的工具 —— 逐改容易漏
@@ -449,8 +468,6 @@ function normalizeWakeArguments(config) {
     // 判据是「参数表里**声明**了 key」，不是「运行时 arguments 里有没有 key」：
     // 声明才是工具的身份，运行时 arguments 是模型可控的 —— 用它来判断
     // 「该不该校验」等于让攻击者自己选考卷。
-    const schema = rest.length >= 2 ? rest[rest.length - 2] : undefined;
-    const handler = rest[rest.length - 1];
     const shape = { ...schema };
     const aliases = TOOL_ARGUMENT_ALIASES[name] || {};
     const required = new Set();
@@ -1209,15 +1226,16 @@ if (cfg.socialV2?.tools?.getImages !== false) {
 if (cfg.socialV2?.sticker?.enabled !== false && cfg.socialV2?.tools?.listStickers !== false) {
   server.tool(
     'qq_list_stickers',
-    '查看 QQ 账号上已收藏的表情包（自定义表情）列表：包含 emoji_id、备注 desc、本地笔记 localNote、标签 tags、使用次数等。可通过 query 按备注/笔记/标签搜索；无备注的表情可以先调用 qq_get_sticker_image 看图理解，再用 qq_sticker_note 记下含义。刚新增/删除表情后如需立即同步，请传 refresh=true。',
+    '查看 QQ 账号上已收藏的表情包（自定义表情）列表：包含 emoji_id、备注 desc、本地笔记 localNote、标签 tags、使用次数等。可通过 query 按备注/笔记/标签搜索；无备注的表情可以先调用 qq_get_sticker_image 看图理解，再用 qq_sticker_note 记下含义。刚新增/删除表情后如需立即同步，请传 refresh=true。列表较长时用 count + offset 翻页：返回里的 truncated=true 表示后面还有，下一次把 offset 设为本次 offset+条数继续取；total/matched 给出总量。',
     {
       key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
       token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
       query: z.string().optional().describe('可选搜索词，按备注/本地笔记/标签/用法过滤'),
       count: z.number().optional().describe('最多返回条数，默认 48，受 socialV2.sticker.maxListCount 配置上限约束（当前通常 100）'),
+      offset: z.number().optional().describe('分页偏移：从第几条开始返回，默认 0；配合 count 翻页使用'),
       refresh: z.boolean().optional().describe('是否强制从 QQ 重新同步收藏表情，默认 false（走缓存）')
     },
-    async ({ key, token, query, count, refresh }) => {
+    async ({ key, token, query, count, offset, refresh }) => {
       try {
         // 强制同步走 POST：GET 上的 refresh 参数会让「读接口」产生写副作用
         // （真的去问 OneBot 拉收藏表情并落盘 state/stickers.json），
@@ -1225,7 +1243,7 @@ if (cfg.socialV2?.sticker?.enabled !== false && cfg.socialV2?.tools?.listSticker
         const data = await agentApi('/api/socialV2/sticker-list', {
           method: 'POST',
           headers: { 'x-agent-token': token },
-          body: JSON.stringify({ key, query: query ? String(query) : '', count, refresh: refresh === true, token })
+          body: JSON.stringify({ key, query: query ? String(query) : '', count, offset, refresh: refresh === true, token })
         });
         return { content: [{ type: 'text', text: serializeModelData(data) }] };
       } catch (error) {
@@ -1430,7 +1448,9 @@ if (cfg.socialV2?.sticker?.enabled !== false && cfg.socialV2?.tools?.stickerNote
   );
 }
 
-if (cfg.socialV2?.sticker?.enabled !== false && cfg.socialV2?.tools?.setStickerRemark !== false) {
+// 注意：本进程读的是原始 config.json（不合并 bridge 默认值），所以默认关闭的工具
+// 必须用 === true（显式开启才注册）；!== false 会让"默认禁用"在注册层失效。
+if (cfg.socialV2?.sticker?.enabled !== false && cfg.socialV2?.tools?.setStickerRemark === true) {
   server.tool(
     'qq_set_sticker_remark',
     '修改 QQ 账号里收藏表情的官方备注（desc）。这是写操作，会直接影响 QQ 账号的表情备注；仅在管理员明确允许（socialV2.tools.setStickerRemark=true）时可用。一般优先用 qq_sticker_note 记录自己的理解，不要随意改官方备注。',
@@ -1450,6 +1470,34 @@ if (cfg.socialV2?.sticker?.enabled !== false && cfg.socialV2?.tools?.setStickerR
         return { content: [{ type: 'text', text: serializeModelData(data) }] };
       } catch (error) {
         return { content: [{ type: 'text', text: `修改表情备注失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+}
+
+// 删除收藏表情是破坏性操作：默认关闭（socialV2.tools.deleteSticker），且桥接侧不直接删，
+// 只生成审批单私聊管理员（ownerQQ），管理员回复 /approve 后才真正删除。
+// 支持批量：一次传最多 50 个 id，桥接只发一条合并审批卡，管理员一次 /approve 全删。
+if (cfg.socialV2?.sticker?.enabled !== false && cfg.socialV2?.tools?.deleteSticker === true) {
+  server.tool(
+    'qq_delete_sticker',
+    '删除 QQ 账号收藏夹里的表情（支持批量，建议一次传完要删的全部 id，不要一张一张调用）。破坏性操作。默认不会立即生效：桥接会私聊管理员发**一张**合并审批卡，管理员同意后才真正删除。返回字段：autoApproved=true 表示管理员已开启自动批准、这批**已经删除**（failed 列出失败项）；pendingApproval=true 表示审批在途，管理员一次 /approve 会把整批删完，你可以稍后调用 qq_list_stickers 确认。skippedStickerIds 是没有找到的表情 id。仅在管理员明确开启（socialV2.tools.deleteSticker=true）时可用。删除前先确认 id 无误，并给出简短删除理由（会发给管理员作为审批依据）。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      stickerIds: z.array(z.string()).min(1).max(50).describe('要删除的表情 emoji_id 数组（从 qq_list_stickers 获取；一次最多 50 个）'),
+      reason: z.string().optional().describe('简短删除理由（随审批单一并发给管理员）')
+    },
+    async ({ key, token, stickerIds, reason }) => {
+      try {
+        const data = await agentApi('/api/socialV2/sticker-delete', {
+          method: 'POST',
+          body: JSON.stringify({ key, stickerIds: stickerIds.map(String), reason: String(reason ?? ''), token }),
+          headers: { 'x-agent-token': token }
+        });
+        return { content: [{ type: 'text', text: serializeModelData(data) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `删除表情审批失败：${error?.message ?? error}` }], isError: true };
       }
     }
   );

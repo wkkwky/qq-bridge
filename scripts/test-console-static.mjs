@@ -40,6 +40,18 @@ ok(/api\('\/api\/voice\/list/.test(html), '面板调用 /api/voice/list（操作
 ok(/api\('\/api\/voice\/send'/.test(html), '面板调用 /api/voice/send');
 ok(/typeof loadVoiceLibrary === 'function'|async function loadVoiceLibrary/.test(html), 'loadVoiceLibrary 已定义');
 
+console.log('## 未授权会话日志级别');
+{
+  const bridgeSrc = fs.readFileSync(path.join(ROOT, 'src', 'bridge.js'), 'utf8');
+  ok(/unauthorizedLog: \['on', 'throttle', 'off'\]\.includes/.test(bridgeSrc), 'bridge 只认 on/throttle/off，默认 throttle');
+  ok(bridgeSrc.includes('function logIgnoredUnauthorized(') && !bridgeSrc.includes('log(`忽略未授权会话 ${key}（当前模式 ${currentMode}，来自 ${event.user_id}）`)'), '未授权日志统一走节流函数');
+  ok(bridgeSrc.includes("plainContent === '/log'"), '支持 /log on|throttle|off 管理命令');
+  ok(bridgeSrc.includes('unauthorizedLog: cfg.unauthorizedLog'), '/api/whitelist 回读日志级别');
+  ok(html.includes('id="unauthorizedLog"'), '白名单页有日志级别下拉');
+  ok(/getElementById\('unauthorizedLog'\)\.value = w\.unauthorizedLog/.test(html), '下拉从 /api/whitelist 回填');
+  ok(/unauthorizedLog: document\.getElementById\('unauthorizedLog'\)\.value/.test(html), '保存白名单时一并提交');
+}
+
 console.log('## JS 语法');
 const scripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/gi)].map((m) => m[1]);
 const big = scripts.sort((a, b) => b.length - a.length)[0];

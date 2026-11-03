@@ -253,7 +253,9 @@ export function formatStickerList(entries, query = '', limit = 48, currentKey = 
       })
     : list;
   const max = Math.max(1, Math.min(500, Number(limit) || 48));
-  const items = filtered.slice(0, max).map((e) => ({
+  // 分页：offset 从第几条开始返回；越界则收敛到末尾（返回空页 + truncated=false）。
+  const off = Math.max(0, Math.min(filtered.length, Math.floor(Number(offset) || 0)));
+  const items = filtered.slice(off, off + max).map((e) => ({
     id: e.id,
     resId: e.resId,
     md5: e.md5,
@@ -269,7 +271,8 @@ export function formatStickerList(entries, query = '', limit = 48, currentKey = 
   return {
     total: list.length,
     matched: filtered.length,
-    truncated: filtered.length > max,
+    offset: off,
+    truncated: off + items.length < filtered.length,
     stickers: items
   };
 }

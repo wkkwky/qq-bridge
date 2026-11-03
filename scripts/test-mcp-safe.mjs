@@ -54,6 +54,13 @@ try {
   console.log('✅ qq_reply 工具:', tools2.tools.some((t) => t.name === 'qq_reply') ? '存在 ✓' : '缺失 ✗');
   console.log('✅ qq_slang_query 工具:', tools2.tools.some((t) => t.name === 'qq_slang_query') ? '存在 ✓' : '缺失 ✗');
   console.log('✅ qq_slang_submit 工具:', tools2.tools.some((t) => t.name === 'qq_slang_submit') ? '存在 ✓' : '缺失 ✗');
+  // qq_delete_sticker（破坏性操作）必须严格跟随 socialV2.tools.deleteSticker：默认 false ⇒ 不注册
+  const cfgTools = (() => { try { return JSON.parse(fs.readFileSync(path.join(ROOT, 'config.json'), 'utf8'))?.socialV2?.tools ?? {}; } catch { return {}; } })();
+  const hasDelete = tools2.tools.some((t) => t.name === 'qq_delete_sticker');
+  if (hasDelete !== (cfgTools.deleteSticker === true)) {
+    throw new Error(`qq_delete_sticker 注册状态与开关不符：工具${hasDelete ? '存在' : '不存在'}，开关=${cfgTools.deleteSticker}`);
+  }
+  console.log(`✅ qq_delete_sticker 注册状态与开关一致（${cfgTools.deleteSticker === true ? '已启用' : '默认禁用，未注册'}）`);
 
   // 白名单内但 replyToMessageId 非法：应在发送前被参数校验拒绝（不会真实发消息）
   const invalidReply = await client.callTool({
@@ -83,6 +90,16 @@ try {
   });
   const replyText = replyDenied.content?.[0]?.text ?? '';
   console.log('🚫 qq_reply 白名单外 结果:', replyDenied.isError ? '被拒绝 ✓' : '⚠️ 未被拒绝（异常！）', replyText.slice(0, 120), '| 校验阶段:', replyText.includes('白名单') ? '白名单（参数已通过）' : (RESERVED2 ? 'token/模式（reserved2 要求 agent token）' : '参数'));
+
+  // 缺 token 软拒：模型漏传 token 时应拿到带补救指引的 isError，而非 MCP 校验层 -32602 硬拒。
+  // 若 schema 里 token 仍是 zod 必填，这次 callTool 会直接抛 McpError，被外层 catch 判为失败。
+  const noToken = await client.callTool({ name: 'qq_send_message', arguments: { key: 'group:100003', messages: '测试' } });
+  const noTokenText = noToken.content?.[0]?.text ?? '';
+  if (!(noToken.isError && noTokenText.includes('缺少会话令牌'))) {
+    throw new Error(`qq_send_message 缺 token 未被软拒: ${noTokenText.slice(0, 120)}`);
+  }
+  const sendMsgRequired = tools2.tools.find((t) => t.name === 'qq_send_message')?.inputSchema?.required ?? [];
+  console.log('✅ qq_send_message 缺 token 软拒（含补救指引）; token 在 schema 中为可选:', sendMsgRequired.includes('token') ? '否 ✗' : '是 ✓');
 
   process.exit(0);
 } catch (error) {

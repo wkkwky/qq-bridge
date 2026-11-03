@@ -299,7 +299,7 @@ export function makeFixtureState() {
     },
     roleInjectMax: 8000,
     dshEffort: 'max',
-    whitelist: { allow: { groups: [123456789, 100003], private: [100001] }, deny: { groups: [], private: [] }, ownerQQ: '100001' },
+    whitelist: { allow: { groups: [123456789, 100003], private: [100001] }, deny: { groups: [], private: [] }, ownerQQ: '100001', unauthorizedLog: 'throttle' },
     sessions: [
       { key: 'group:123456789', sessionId: 'demo-community-20260920', owner: false },
       { key: 'group:100003', sessionId: 'demo-development-20260920', owner: false },

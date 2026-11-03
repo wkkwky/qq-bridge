@@ -7,6 +7,10 @@ rem permission it prints a copy-pasteable command and exits 0.
 rem See docs/guides/SECURITY_BASELINE.md ("secrets at rest").
 node scripts\harden-state-acl.mjs --quiet
 :loop
+rem DSH Desktop picks a random port on every launch (issue #56): re-sync dsh.baseUrl
+rem before each start. This never blocks startup - if DSH is not up yet the script
+rem prints why and exits, and the bridge below starts anyway.
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0sync-dsh-port.ps1" -NoPause
 node "%~dp0src\bridge.js"
 set code=%errorlevel%
 if "%code%"=="2" (

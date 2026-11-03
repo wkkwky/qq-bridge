@@ -31,6 +31,7 @@ import { discoverSnowLumaConnection, persistSnowLumaEndpoint, persistToken } fro
 import { hardenDir, manualDirCommand } from './state-acl.mjs';
 import { extractForwardIds, forwardIdFromData, sanitizeForwardId, formatForwardResponse } from './forward.js';
 import { resolvePriceTable } from './model-prices.js';
+import { normalizeQuietHours, quietHoursActive } from './quiet-hours.js';
 import { createTokenLedger } from './token-ledger.js';
 import {
   loadSlang,
@@ -735,6 +736,8 @@ function loadConfig() {
     ignore: { sendQQ: normalizeIdList(file.ignore?.sendQQ ?? file.ignore?.senders ?? []) },
     // 私聊/群聊均未配置白名单时是否放行所有（true 时启动会打警告）
     allowAllWhenEmpty: file.allowAllWhenEmpty === true,
+    // 未授权会话（不在白名单/当前模式不允许）的日志：on=每条都打；throttle=每 10 分钟汇总一条（默认，避免刷屏）；off=完全不打
+    unauthorizedLog: ['on', 'throttle', 'off'].includes(file.unauthorizedLog) ? file.unauthorizedLog : 'throttle',
     ackMessage: file.ackMessage ?? '🤔 收到，正在思考…',
     sendDelayMs: file.sendDelayMs ?? 300,
     questionTimeoutMs: file.questionTimeoutMs ?? 5 * 60 * 1000,
@@ -811,6 +814,7 @@ function loadConfig() {
         reply: true,
         sendBurst: true,
         sendMessage: true,
+        singCover: 'sing_cover / sing_search（唱一段歌，最多 4 分钟）',
         waitMessages: true,
         feedback: true,
         getMyRecent: true,
@@ -826,6 +830,7 @@ function loadConfig() {
         getStickerImage: true,
         sendSticker: true,
         setStickerRemark: false,
+        deleteSticker: false,
         stickerNote: true,
         collectSticker: true,
         getSelfImage: true
@@ -886,6 +891,10 @@ function loadConfig() {
           maxPerMinute: 2,         // 每分钟最多收藏次数
           maxPerHour: 10,          // 每小时最多收藏次数
           maxRemarkChars: 20       // 收藏时备注最大长度
+        },
+        deleteApprove: {
+          auto: false,             // 自动批准删除：AI 请求直接删，不等管理员 /approve（破坏性操作，默认关）
+          dailyLimit: 20           // 自动批准每日上限（内存计数，重启清零）；超出后退回人工审批
         }
       },
       proactive: {
@@ -898,6 +907,11 @@ function loadConfig() {
       feedback: {
         maxLength: 500,
         notifyOwnerOnError: false
+      },
+      quietHours: {
+        enabled: false,          // 时段静默总开关：开启后落在时段内的计划唤醒直接丢弃
+        scope: 'all',            // 'all'=群聊+私聊；'groups'=仅群聊
+        ranges: []               // [["23:30","07:00"], ...] 本地时间，支持跨零点
       },
       context: {
         recentLimit: 100,
@@ -951,6 +965,7 @@ function loadConfig() {
     getStickerImage: true,
     sendSticker: true,
     setStickerRemark: false,
+    deleteSticker: false,
     stickerNote: true,
     collectSticker: true,
     getSelfImage: true,
@@ -1003,6 +1018,11 @@ function loadConfig() {
       maxPerHour: 10,
       maxRemarkChars: 20,
       ...((cfg.socialV2?.sticker?.collect) ?? {})
+    },
+    deleteApprove: {
+      auto: false,
+      dailyLimit: 20,
+      ...((cfg.socialV2?.sticker?.deleteApprove) ?? {})
     }
   };
 
@@ -2128,6 +2148,154 @@ async function main() {
     stickerEntries = updated.entries;
     saveStickerStoreSafe();
     return stickerEntries.find((e) => e.id === entry.id) || null;
+  }
+
+  // ── 删除收藏表情（破坏性操作 → 管理员审批制） ──────────────────────────────
+  // AI 调用只生成审批单并私聊 owner，真正删除发生在 owner 回复 /approve 之后。
+  // 审批单只在内存（10 分钟 TTL）：重启桥接=全部作废，符合"未决即否"的安全语义。
+  const stickerDeleteApprovals = new Map(); // approvalId -> { key, items: [{ stickerId, desc }], reason, createdAt }
+
+  // 通知合并发送：AI 连删多张时每张一条私聊太吵也太费 token。
+  // 空闲窗口：每来一张新单重置计时，停顿 5 秒才发（AI 串行删除时单圈就要数秒，固定窗口会漏）；
+  // 但从首个请求起最多拖 15 秒，防止连续加单无限拖延。
+  const stickerDeleteNotifyQueue = []; // { kind:'approval', id } | { kind:'auto', snapshot }
+  let stickerDeleteNotifyTimer = null;
+  let stickerDeleteNotifyFirstAt = 0;
+
+  // 自动批准配额：按本地自然日计数，只在内存（重启清零）。
+  // ponytail: 不落盘——重启本身就会清空全部在途审批单，配额跟着重置是可接受的偏差；真需要持久配额再写进状态文件。
+  let autoApproveDay = '';
+  let autoApproveCount = 0;
+
+  function autoApproveBudget() {
+    const conf = cfg.socialV2?.sticker?.deleteApprove ?? {};
+    if (conf.auto !== true) return 0;
+    const day = new Date().toDateString();
+    if (day !== autoApproveDay) { autoApproveDay = day; autoApproveCount = 0; }
+    const limit = Math.max(0, Math.round(Number(conf.dailyLimit) || 0));
+    return Math.max(0, limit - autoApproveCount);
+  }
+
+  function queueStickerDeleteNotify(item) {
+    stickerDeleteNotifyQueue.push(item);
+    const now = Date.now();
+    if (!stickerDeleteNotifyTimer) stickerDeleteNotifyFirstAt = now;
+    clearTimeout(stickerDeleteNotifyTimer);
+    const delay = Math.max(0, Math.min(5000, stickerDeleteNotifyFirstAt + 15000 - now));
+    stickerDeleteNotifyTimer = setTimeout(() => {
+      stickerDeleteNotifyTimer = null;
+      void flushStickerDeleteNotifications().catch((error) => log('⚠️ 表情删除通知发送失败：', error?.message ?? error));
+    }, delay);
+  }
+
+  // 审批单里的一批表情怎么念：单张带备注，多张只报数量和 id（27 张的备注拼起来太费 token）。
+  function describeDeleteItems(items) {
+    if (items.length === 1) {
+      const it = items[0];
+      return `#${it.stickerId}${it.desc ? `（${it.desc}）` : ''}`;
+    }
+    return `${items.length} 张：${items.map((it) => `#${it.stickerId}`).join('、')}`;
+  }
+
+  async function flushStickerDeleteNotifications() {
+    const items = stickerDeleteNotifyQueue.splice(0);
+    const autos = items.filter((it) => it.kind === 'auto').map((it) => it.snapshot);
+    // 窗口期内已被处理（批准/拒绝/过期）的审批单不再打扰管理员
+    const pendings = items
+      .filter((it) => it.kind === 'approval' && stickerDeleteApprovals.has(it.id))
+      .map((it) => ({ id: it.id, a: stickerDeleteApprovals.get(it.id) }));
+    if (!autos.length && !pendings.length) return;
+    const parts = [];
+    if (pendings.length) {
+      const multiKey = new Set(pendings.map((p) => p.a.key)).size > 1;
+      const lines = pendings.map(({ id, a }) => `${multiKey ? `[${a.key}] ` : ''}${describeDeleteItems(a.items)} 单号 ${id}${a.reason ? `，理由：${a.reason}` : ''}`);
+      const first = pendings[0].a;
+      const total = pendings.reduce((n, p) => n + p.a.items.length, 0);
+      parts.push(pendings.length === 1 && total === 1
+        ? `【删除表情审批】\n会话 ${first.key} 的 AI 请求删除收藏表情 ${lines[0]}`
+        : `【删除表情审批】会话 ${first.key}${multiKey ? ' 等' : ''} 的 AI 请求删除 ${total} 张收藏表情：\n${lines.join('\n')}`);
+      parts.push(`回复 /approve <单号> 同意、/reject <单号> 拒绝；只有一张待审时直接回 /approve 或 /reject 即可；有多张时 /approve all 一次全同意、/reject all 全拒绝。10 分钟内有效。`);
+      if (cfg.socialV2?.sticker?.deleteApprove?.auto === true) {
+        parts.push('（自动批准今日额度不足，这批需手动审批；/stickerauto off 可彻底关闭自动批准。）');
+      }
+    }
+    if (autos.length) {
+      const lines = autos.map((a) => `会话 ${a.key}：${describeDeleteItems(a.done)}${a.reason ? ` 理由：${a.reason}` : ''}${a.failed.length ? `\n失败 ${a.failed.length} 张：${a.failed.map((f) => `#${f.stickerId} ${f.error}`).join('；')}` : ''}`);
+      parts.push(`【表情删除·自动批准】已删除 ${autos.reduce((n, a) => n + a.done.length, 0)} 张：\n${lines.join('\n')}\n今日剩余自动批准额度 ${autoApproveBudget()} 张；/stickerauto off 可关闭自动批准。`);
+    }
+    await sendToQQ(`private:${cfg.ownerQQ}`, parts.join('\n'));
+  }
+
+  // 批量删除（单张也走这里：items 长度为 1 就是原来的单张审批）。
+  // 一次同步、一张审批单、一条审批卡，管理员 /approve <单号> 一次把整批删完。
+  async function requestStickerDeleteV2(key, stickerIds, reason) {
+    if (!cfg.ownerQQ) throw new Error('未配置管理员 QQ（ownerQQ），无法发起删除审批');
+    const wanted = [...new Set((Array.isArray(stickerIds) ? stickerIds : [stickerIds]).map((s) => String(s ?? '').trim()).filter(Boolean))];
+    if (!wanted.length) throw new Error('stickerIds 不能为空');
+    if (wanted.length > 50) throw new Error(`一次最多删除 50 张，本次传入 ${wanted.length} 张`);
+    const synced = await syncStickerLibrary(false);
+    const entries = [];
+    const missing = [];
+    for (const id of wanted) {
+      const found = findSticker(synced?.entries ?? stickerEntries, id);
+      if (found) entries.push(found); else missing.push(id);
+    }
+    if (!entries.length) throw new Error(`找不到任何表情（${missing.slice(0, 5).join('、')}${missing.length > 5 ? ' 等' : ''}），请先用 qq_list_stickers 获取有效 id`);
+    // 惰性清理 10 分钟前的过期审批单
+    for (const [id, a] of stickerDeleteApprovals) {
+      if (Date.now() - a.createdAt > 10 * 60 * 1000) stickerDeleteApprovals.delete(id);
+    }
+    // 已在在途审批里的表情跳过，避免重复提交刷屏
+    const pendingIds = new Set();
+    for (const a of stickerDeleteApprovals.values()) for (const it of a.items) pendingIds.add(it.stickerId);
+    const items = entries.filter((e) => !pendingIds.has(e.id)).map((e) => ({ stickerId: e.id, desc: e.desc ?? '' }));
+    if (!items.length) throw new Error('这批表情都已有在途审批，等管理员 /approve 即可，无需重复提交');
+    const approvalId = crypto.randomBytes(3).toString('hex');
+    const cleanReason = String(reason ?? '').trim().slice(0, 100);
+    const approval = { key, items, reason: cleanReason, createdAt: Date.now() };
+    stickerDeleteApprovals.set(approvalId, approval);
+    // 自动批准：整批都在今日剩余额度内才直接执行（不做半批自动半批人工，行为更好预期）。
+    if (autoApproveBudget() >= items.length) {
+      try {
+        const result = await executeStickerDeleteV2(approvalId);
+        autoApproveCount += result.done.length;
+        log(`[sticker] 自动批准删除 ${result.done.length} 张（今日第 ${autoApproveCount} 张）${result.failed.length ? `，失败 ${result.failed.length} 张` : ''}`);
+        queueStickerDeleteNotify({ kind: 'auto', snapshot: { key, done: result.done, failed: result.failed, reason: cleanReason } });
+        return { approvalId, items, skipped: missing, autoApproved: true, done: result.done, failed: result.failed };
+      } catch (error) {
+        log(`⚠️ 批量自动删除失败，转人工审批：`, error?.message ?? error);
+      }
+    }
+    queueStickerDeleteNotify({ kind: 'approval', id: approvalId });
+    return { approvalId, items, skipped: missing };
+  }
+
+  async function executeStickerDeleteV2(approvalId) {
+    const a = stickerDeleteApprovals.get(approvalId);
+    if (!a) throw new Error(`审批单 ${approvalId} 不存在或已过期（10 分钟有效）`);
+    const done = [];
+    const failed = [];
+    for (const it of a.items) {
+      try {
+        // delete_custom_face：NapCat/Lagrange 系扩展，从 QQ 账号收藏里真删。
+        // 参数名实现不一（有的要 id、有的要 emoji_id——后者缺了会报 "emoji_id: is required"），两个都给，多余字段会被忽略。
+        const response = await bot.request('delete_custom_face', { id: it.stickerId, emoji_id: it.stickerId });
+        if (!response || response.status !== 'ok' || response.retcode !== 0) {
+          throw new Error(`delete_custom_face 失败: ${response?.wording || response?.retcode || 'unknown'}`);
+        }
+        done.push(it);
+      } catch (error) {
+        failed.push({ ...it, error: error?.message ?? String(error) });
+      }
+    }
+    // 全失败则保留审批单，修好问题后重发 /approve 还能重试
+    if (!done.length) throw new Error(failed.map((f) => `#${f.stickerId}: ${f.error}`).join('；'));
+    stickerDeleteApprovals.delete(approvalId);
+    // 本地库同步移除（下次定时同步也会清，这里立即保持一致，防止窗口期内 AI 又发这张图）
+    const doneIds = new Set(done.map((d) => d.stickerId));
+    stickerEntries = (stickerEntries || []).filter((e) => !doneIds.has(e.id));
+    saveStickerStoreSafe();
+    return { done, failed };
   }
 
   // 收藏聊天里的一张表情（add_custom_face），并按 AI 看到的含义写简短备注（modify_custom_face）。
@@ -3911,6 +4079,7 @@ async function main() {
               || url.pathname === '/api/stickers/remark'
               || url.pathname === '/api/socialV2/sticker-note'
               || url.pathname === '/api/socialV2/sticker-remark'
+              || url.pathname === '/api/socialV2/sticker-delete'
               || url.pathname === '/api/socialV2/collect-sticker')) ? '表情库'
               : '';
           if (readonlyStore) {
@@ -4548,7 +4717,7 @@ async function main() {
         }
         // ── 白名单可视化编辑（写 config.json + 热更新内存） ───────────────────
         if (req.method === 'GET' && url.pathname === '/api/whitelist') {
-          sendJson({ allow: cfg.allow ?? { private: [], groups: [] }, deny: cfg.deny ?? { private: [], groups: [] }, ownerQQ: cfg.ownerQQ ?? null });
+          sendJson({ allow: cfg.allow ?? { private: [], groups: [] }, deny: cfg.deny ?? { private: [], groups: [] }, ownerQQ: cfg.ownerQQ ?? null, unauthorizedLog: cfg.unauthorizedLog });
           return;
         }
         if (req.method === 'POST' && url.pathname === '/api/whitelist') {
@@ -4578,13 +4747,22 @@ async function main() {
           file.allow = allow;
           file.deny = deny;
           file.ownerQQ = ownerQQ;
+          // 未授权会话日志级别（可选字段，缺省保持当前值）
+          let unauthorizedLog = cfg.unauthorizedLog;
+          if (body.unauthorizedLog !== undefined) {
+            const v = String(body.unauthorizedLog);
+            if (!['on', 'throttle', 'off'].includes(v)) { sendJson({ ok: false, error: 'unauthorizedLog 只能是 on / throttle / off' }, 400); return; }
+            unauthorizedLog = v;
+            file.unauthorizedLog = v;
+          }
           atomicWriteJson(configFile, file);
           cfg.allow = { private: allow.private, groups: allow.groups };
           cfg.deny = { private: deny.private, groups: deny.groups };
           cfg.ownerQQ = ownerQQ;
+          cfg.unauthorizedLog = unauthorizedLog;
           reconcileSessionPolicies();
-          log(`控制台：白名单已更新（群: ${allow.groups.join(',') || '无'}，私聊: ${allow.private.join(',') || '无'}，管理员: ${ownerQQ ?? '未设置'}）`);
-          sendJson({ ok: true, allow, deny, ownerQQ });
+          log(`控制台：白名单已更新（群: ${allow.groups.join(',') || '无'}，私聊: ${allow.private.join(',') || '无'}，管理员: ${ownerQQ ?? '未设置'}，未授权日志: ${unauthorizedLog}）`);
+          sendJson({ ok: true, allow, deny, ownerQQ, unauthorizedLog });
           return;
         }
 
@@ -4953,7 +5131,7 @@ async function main() {
             merged.autoReplyCheckMs = Number.isFinite(n) ? Math.max(1000, Math.round(n)) : (current.autoReplyCheckMs ?? 30000);
           }
           // tools：只接受布尔开关
-          const toolFlags = ['getPrompt', 'getUnread', 'getRecent', 'socialState', 'sendGroup', 'sendPrivate', 'reply', 'sendBurst', 'sendMessage', 'waitMessages', 'feedback', 'getMyRecent', 'getMessageDetail', 'getActiveMembers', 'setWakeConfig', 'markRead', 'memory', 'slangQuery', 'slangSubmit', 'getImages', 'getForwardMsg', 'sendPoke', 'listStickers', 'getStickerImage', 'sendSticker', 'setStickerRemark', 'stickerNote', 'collectSticker', 'getSelfImage', 'sendVoice'];
+          const toolFlags = ['getPrompt', 'getUnread', 'getRecent', 'socialState', 'sendGroup', 'sendPrivate', 'reply', 'sendBurst', 'sendMessage', 'waitMessages', 'feedback', 'getMyRecent', 'getMessageDetail', 'getActiveMembers', 'setWakeConfig', 'markRead', 'memory', 'slangQuery', 'slangSubmit', 'getImages', 'getForwardMsg', 'sendPoke', 'listStickers', 'getStickerImage', 'sendSticker', 'setStickerRemark', 'deleteSticker', 'stickerNote', 'collectSticker', 'getSelfImage', 'sendVoice'];
           if (body.tools && typeof body.tools === 'object') {
             merged.tools = { ...(current.tools ?? {}), ...body.tools };
             for (const k of toolFlags) {
@@ -5043,6 +5221,17 @@ async function main() {
                 }
               }
             }
+            // deleteApprove：删除表情的自动批准开关 + 每日上限
+            if (body.sticker.deleteApprove && typeof body.sticker.deleteApprove === 'object') {
+              merged.sticker.deleteApprove = { ...(current.sticker?.deleteApprove ?? {}), ...body.sticker.deleteApprove };
+              merged.sticker.deleteApprove.auto = merged.sticker.deleteApprove.auto === true;
+              const limit = Number(merged.sticker.deleteApprove.dailyLimit);
+              merged.sticker.deleteApprove.dailyLimit = Number.isFinite(limit) ? Math.min(200, Math.max(0, Math.round(limit))) : current.sticker?.deleteApprove?.dailyLimit ?? 20;
+            }
+          }
+          // quietHours：时段静默。控制台总是整段提交，直接归一化替换即可（不做字段级 merge）。
+          if (body.quietHours && typeof body.quietHours === 'object') {
+            merged.quietHours = normalizeQuietHours(body.quietHours);
           }
           // feedback：数值/布尔归一化
           if (body.feedback && typeof body.feedback === 'object') {
@@ -5213,13 +5402,14 @@ async function main() {
             getStickerImage: 'qq_get_sticker_image',
             sendSticker: 'qq_send_sticker',
             setStickerRemark: 'qq_set_sticker_remark',
+            deleteSticker: 'qq_delete_sticker',
             stickerNote: 'qq_sticker_note',
             collectSticker: 'qq_collect_sticker',
             getSelfImage: 'qq_get_self_image',
             sendVoice: 'qq_send_voice / qq_list_voices'
           };
           const tools = cfg.socialV2?.tools ?? {};
-          const stickerToolFlags = new Set(['listStickers', 'getStickerImage', 'sendSticker', 'setStickerRemark', 'stickerNote', 'collectSticker']);
+          const stickerToolFlags = new Set(['listStickers', 'getStickerImage', 'sendSticker', 'setStickerRemark', 'deleteSticker', 'stickerNote', 'collectSticker']);
           const enabledTools = [];
           for (const [flag, name] of Object.entries(toolMap)) {
             if (tools[flag] !== false && !(stickerToolFlags.has(flag) && !stickerEnabled())) enabledTools.push(name);
@@ -6092,6 +6282,36 @@ async function main() {
           }
           return;
         }
+        // 删除收藏表情：不在此端点真删——只生成审批单私聊 owner，/approve 后由 executeStickerDeleteV2 执行。
+        // 支持批量：stickerIds 数组（一次一张审批卡、一次 /approve 全删）；`stickerId` 单张写法仍然兼容。
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/sticker-delete') {
+          if (!stickerEnabled()) { sendJson({ ok: false, error: '表情包体系已关闭' }, 403); return; }
+          const body = await readBody();
+          const key = String(body.key ?? '').trim();
+          const stickerIds = Array.isArray(body.stickerIds) ? body.stickerIds : [body.stickerId];
+          if (!key || !stickerIds.some((s) => String(s ?? '').trim())) { sendJson({ ok: false, error: 'key 和 stickerIds 不能为空' }, 400); return; }
+          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
+          if (req.headers['x-agent-token'] && !v2ToolEnabled('deleteSticker')) { sendJson({ ok: false, error: '工具未启用：qq_delete_sticker' }, 403); return; }
+          try {
+            const r = await requestStickerDeleteV2(key, stickerIds, body.reason);
+            log(`[sticker] 删除审批 ${key}: ${r.items.length} 张 -> ${r.autoApproved ? '自动批准已删除' : `审批单 ${r.approvalId}`}${r.skipped.length ? `（${r.skipped.length} 张找不到已跳过）` : ''}`);
+            sendJson({
+              ok: true,
+              autoApproved: r.autoApproved === true,
+              pendingApproval: r.autoApproved !== true,
+              approvalId: r.approvalId,
+              count: r.autoApproved ? r.done.length : r.items.length,
+              stickers: r.autoApproved ? r.done : r.items,
+              failed: r.autoApproved ? r.failed : [],
+              skippedStickerIds: r.skipped,
+              ...(r.items.length === 1 ? { sticker: r.autoApproved ? r.done[0] : r.items[0] } : {})
+            });
+          } catch (error) {
+            sendJson({ ok: false, error: `发起删除审批失败：${error?.message ?? error}` }, 500);
+          }
+          return;
+        }
         // ── 语音发送（操作者通道：CLI / 控制台，凭 consoleToken） ──────────────
         //
         // 与 /api/send/* 的 agent 通道分开：操作者可能不在任何 QQ 会话里，
@@ -6487,6 +6707,7 @@ async function main() {
           const query = String(url.searchParams.get('query') ?? '').trim();
           const maxCount = Math.max(1, Number(cfg.socialV2?.sticker?.maxListCount) || 100);
           const count = Math.min(500, Math.max(1, Math.min(Number(url.searchParams.get('count')) || 48, maxCount)));
+          const offset = Math.max(0, Math.floor(Number(url.searchParams.get('offset')) || 0));
           // GET 上**不再支持** refresh：强制同步是有副作用的写操作（拉 OneBot 收藏表情并落盘），
           // 挂在 GET 上会绕开「非 GET 必须 application/json + 同源 Origin」的 CSRF 防护。
           // 需要强制同步时请用同一路径的 POST，或控制台的 POST /api/stickers/sync。
@@ -6511,6 +6732,7 @@ async function main() {
           const query = String(body.query ?? '').trim();
           const maxCount = Math.max(1, Number(cfg.socialV2?.sticker?.maxListCount) || 100);
           const count = Math.min(500, Math.max(1, Math.min(Number(body.count) || 48, maxCount)));
+          const offset = Math.max(0, Math.floor(Number(body.offset) || 0));
           let force = body.refresh === true;
           if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
           if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
@@ -6536,10 +6758,11 @@ async function main() {
           const query = String(url.searchParams.get('query') ?? '').trim();
           const maxCount = Math.max(1, Number(cfg.socialV2?.sticker?.maxListCount) || 100);
           const count = Math.min(500, Math.max(1, Math.min(Number(url.searchParams.get('count')) || 48, maxCount)));
+          const offset = Math.max(0, Math.floor(Number(url.searchParams.get('offset')) || 0));
           // GET 不再触发强制同步（写副作用不能挂在读接口上）：请用 POST /api/stickers/sync。
           try {
             const synced = await syncStickerLibrary(false);
-            const list = formatStickerList(synced?.entries ?? stickerEntries, query, count);
+            const list = formatStickerList(synced?.entries ?? stickerEntries, query, count, offset);
             sendJson({ ok: true, ...list, syncedAt: synced?.syncedAt ?? stickerSyncedAt, fromCache: synced?.fromCache ?? false, writable: stickerStoreWritable });
           } catch (error) {
             sendJson({ ok: false, error: `获取表情失败：${error?.message ?? error}` }, 500);
@@ -11477,6 +11700,11 @@ async function main() {
   function scheduleWakeV2(key, reason) {
     if (cfg.socialV2?.enabled === false) return;
     if (socialV2.paused) return;
+    // 时段静默：直接丢弃（不暂存、不补发）；消息照常进 backlog，静默外第一次唤醒会一起带上来。
+    if (quietHoursActive(cfg.socialV2?.quietHours, key)) {
+      log(`[reserved2] 静默时段丢弃唤醒 ${key}（${reason}）`);
+      return;
+    }
     if (!isSessionAllowedInCurrentMode(key)) {
       log(`[reserved2] 跳过计划唤醒 ${key}（${reason}）：会话已不在当前模式允许范围内`);
       return;
@@ -11513,6 +11741,11 @@ async function main() {
       st.pendingWakeTimer = null;
       const finalReason = st.pendingWakeReason || reason;
       st.pendingWakeReason = null;
+      // 到点再查一次：合并窗口（数秒）内可能跨入静默段，跨过则连这一发也丢掉。
+      if (quietHoursActive(cfg.socialV2?.quietHours, key)) {
+        log(`[reserved2] 静默时段丢弃到点唤醒 ${key}（${finalReason}）`);
+        return;
+      }
       void sendWakePromptV2(key, finalReason).catch((error) => log(`[reserved2] 计划唤醒异常 ${key}:`, error?.message ?? error));
     }, batchMs);
     // 与其它 per-conversation 定时器保持一致：别让一个待唤醒定时器把进程钉住不退出。
@@ -11695,11 +11928,30 @@ async function main() {
     promptQueues.clear();
   }
 
+  // 未授权会话日志：默认 throttle —— 每条都打会把日志刷满（陌生群刷屏时尤甚），
+  // 10 分钟汇总一条既不丢信息也不吵。切到 on 可逐条排查，off 完全静默。
+  // ponytail: 汇总靠「下一条被忽略的消息」触发，没有定时器；流量归零后不会有最后一条尾巴，属可接受偏差。
+  const ignoredUnauthorized = { count: 0, keys: new Set(), lastAt: Date.now() };
+  function logIgnoredUnauthorized(key, uid) {
+    const mode = cfg.unauthorizedLog;
+    if (mode === 'off') return;
+    if (mode === 'on') { log(`忽略未授权会话 ${key}（当前模式 ${currentMode}，来自 ${uid}）`); return; }
+    ignoredUnauthorized.count += 1;
+    ignoredUnauthorized.keys.add(key);
+    const now = Date.now();
+    if (now - ignoredUnauthorized.lastAt < 10 * 60 * 1000) return;
+    const keys = [...ignoredUnauthorized.keys];
+    log(`忽略未授权会话消息 ${ignoredUnauthorized.count} 条（${keys.length} 个会话）：${keys.slice(0, 10).join('、')}${keys.length > 10 ? ' 等' : ''}（当前模式 ${currentMode}；可在控制台白名单页或 /log 调整日志级别）`);
+    ignoredUnauthorized.count = 0;
+    ignoredUnauthorized.keys.clear();
+    ignoredUnauthorized.lastAt = now;
+  }
+
   // QQ 消息 → DSH prompt
   async function handleIncoming(kind, id, event, cfg) {
     const key = convKey(kind, id);
     if (!modeAllowed(key, kind, id, cfg, currentMode)) {
-      log(`忽略未授权会话 ${key}（当前模式 ${currentMode}，来自 ${event.user_id}）`);
+      logIgnoredUnauthorized(key, event.user_id);
       return;
     }
     if (ignoredSender(event.user_id, cfg)) {
@@ -11769,6 +12021,21 @@ async function main() {
       return;
     }
 
+    // 管理命令用的配置持久化：与控制台 POST /api/socialV2/config 同一份文件同一写法。
+    function persistSocialV2Section(section, value) {
+      try {
+        const configFile = path.join(ROOT, 'config.json');
+        const file = JSON.parse(fs.readFileSync(configFile, 'utf8'));
+        file.socialV2 = { ...(file.socialV2 ?? {}), [section]: value };
+        atomicWriteJson(configFile, file);
+        cfg.socialV2 = { ...(cfg.socialV2 ?? {}), [section]: value };
+        return true;
+      } catch (error) {
+        log(`⚠️ 写入配置失败（${section}）：${error?.message ?? error}`);
+        return false;
+      }
+    }
+
     // 管理命令：仅管理员（ownerQQ）可用，且由桥接直接执行（硬性，不经过模型）
     if (plainContent.startsWith('/')) {
       if (!isOwner) {
@@ -11832,6 +12099,168 @@ async function main() {
       if (plainContent === '/status') {
         const rs = readRoleState();
         await sendToQQ(key, `会话 ${state.sessions[key] ?? '未创建'}；白名单 ${allowed(kind, id, cfg) ? '通过' : '拦截'}；角色 ${rs.role ?? '无'}；模式 ${rs.mode}`);
+        return;
+      }
+      // /quiet：时段静默开关。与控制台「二代仿真配置 → 时段静默」读写同一份 socialV2.quietHours。
+      if (plainContent === '/quiet' || plainContent.startsWith('/quiet ')) {
+        const arg = plainContent.slice(7).trim();
+        const cur = normalizeQuietHours(cfg.socialV2?.quietHours);
+        const fmt = (q) => `时段静默：${q.enabled ? '开' : '关'}；范围：${q.scope === 'groups' ? '仅群聊' : '群聊+私聊'}；时段：${q.ranges.map((r) => r.join('-')).join('，') || '（未设置）'}`;
+        let next = null;
+        let reply = '';
+        if (!arg) {
+          reply = fmt(cur);
+        } else if (arg === 'on' || arg === 'off') {
+          next = { ...cur, enabled: arg === 'on' };
+          reply = arg === 'on' ? '已开启时段静默' : '已关闭时段静默';
+        } else if (arg === 'groups' || arg === 'all') {
+          next = { ...cur, scope: arg };
+          reply = arg === 'groups' ? '静默范围改为：仅群聊' : '静默范围改为：群聊+私聊';
+        } else if (arg === 'clear') {
+          next = { ...cur, ranges: [] };
+          reply = '已清空静默时段';
+        } else {
+          // 形如 23:30-07:00；多段用逗号分隔，整段替换
+          const parts = arg.split(/[，,]/).map((s) => s.trim()).filter(Boolean);
+          const ranges = parts.map((p) => {
+            const m = /^(\d{1,2}:\d{2})\s*[-~—]\s*(\d{1,2}:\d{2})$/.exec(p);
+            return m ? [m[1], m[2]] : null;
+          });
+          if (parts.length && ranges.every(Boolean)) {
+            next = { ...cur, ranges };
+            reply = '静默时段已更新';
+          } else {
+            reply = '用法：/quiet 查看；/quiet on|off 开关；/quiet groups|all 范围；/quiet 23:30-07:00 设置时段（多段逗号分隔）；/quiet clear 清空时段';
+          }
+        }
+        if (next) {
+          const normalized = normalizeQuietHours(next);
+          if (persistSocialV2Section('quietHours', normalized)) reply += `（${fmt(normalized)}）`;
+          else reply = '写入配置失败，请查看桥接日志。';
+        }
+        await sendToQQ(key, reply);
+        return;
+      }
+      // /log：未授权会话日志级别（陌生群刷屏时的日志污染治理）。与控制台「白名单 / 管理员」页同一份 config.unauthorizedLog。
+      if (plainContent === '/log' || plainContent.startsWith('/log ')) {
+        const arg = plainContent.slice(4).trim();
+        const cur = cfg.unauthorizedLog ?? 'throttle';
+        if (!arg) {
+          await sendToQQ(key, `未授权会话日志：${cur}。throttle=每 10 分钟汇总一条（默认）；on=每条都打（排查用）；off=完全不打。\n用法：/log on|throttle|off`);
+          return;
+        }
+        if (!['on', 'throttle', 'off'].includes(arg)) {
+          await sendToQQ(key, '用法：/log on|throttle|off（throttle=汇总，on=逐条，off=静默）');
+          return;
+        }
+        try {
+          const configFile = path.join(ROOT, 'config.json');
+          const file = readConfigObject(configFile);
+          file.unauthorizedLog = arg;
+          atomicWriteJson(configFile, file);
+        } catch (error) {
+          await sendToQQ(key, `写入配置失败：${error?.message ?? error}`);
+          return;
+        }
+        cfg.unauthorizedLog = arg;
+        await sendToQQ(key, `未授权会话日志已设为 ${arg}${arg === 'on' ? '（陌生会话会逐条打日志）' : ''}。`);
+        return;
+      }
+      // /stickerauto：删除表情的自动批准开关。与控制台「表情包参数 → 删除表情自动批准」同一份 socialV2.sticker.deleteApprove。
+      if (plainContent === '/stickerauto' || plainContent.startsWith('/stickerauto ')) {
+        const arg = plainContent.slice(12).trim();
+        const cur = { ...(cfg.socialV2?.sticker?.deleteApprove ?? {}) };
+        const fmt = () => `删除表情自动批准：${cur.auto === true ? '开' : '关'}；每日上限 ${cur.dailyLimit ?? 20} 张；今日已自动批准 ${autoApproveCount} 张`;
+        if (!arg) {
+          await sendToQQ(key, `${fmt()}。\n用法：/stickerauto on|off 开关；/stickerauto limit 50 改每日上限。需先在控制台开启 qq_delete_sticker 工具。`);
+          return;
+        }
+        if (arg === 'on' || arg === 'off') {
+          cur.auto = arg === 'on';
+        } else if (arg.startsWith('limit')) {
+          const n = Number(arg.split(/\s+/)[1]);
+          if (!Number.isFinite(n) || n < 0) { await sendToQQ(key, '用法：/stickerauto limit 50（0 表示不自动批准）'); return; }
+          cur.dailyLimit = Math.min(200, Math.max(0, Math.round(n)));
+        } else {
+          await sendToQQ(key, '用法：/stickerauto 查看；/stickerauto on|off 开关；/stickerauto limit 50 改每日上限');
+          return;
+        }
+        const next = { auto: false, dailyLimit: 20, ...cur };
+        if (!persistSocialV2Section('sticker', { ...(cfg.socialV2?.sticker ?? {}), deleteApprove: next })) {
+          await sendToQQ(key, '写入配置失败，请查看桥接日志。');
+          return;
+        }
+        cfg.socialV2.sticker = { ...(cfg.socialV2?.sticker ?? {}), deleteApprove: next };
+        await sendToQQ(key, next.auto
+          ? `${fmt()}。AI 请求删除将直接执行，不再等你 /approve（仍会私聊通知你删了什么）。`
+          : `${fmt()}。AI 请求删除恢复私聊审批。`);
+        return;
+      }
+      // /approve /reject：审批 AI 发起的删除表情请求（审批单由 requestStickerDeleteV2 生成，10 分钟有效）
+      // 不带 id：只有一张在途单时直接作用于它；多张则提示用 all 或指定 id
+      if (plainContent === '/approve' || plainContent.startsWith('/approve ') || plainContent === '/reject' || plainContent.startsWith('/reject ')) {
+        const isApprove = plainContent.startsWith('/approve');
+        const verb = isApprove ? '同意' : '拒绝';
+        let arg = plainContent.split(/\s+/)[1] ?? '';
+        // 惰性清理过期单
+        for (const [id, a] of stickerDeleteApprovals) {
+          if (Date.now() - a.createdAt > 10 * 60 * 1000) stickerDeleteApprovals.delete(id);
+        }
+        // 批量：/approve all | /reject all
+        if (arg === 'all') {
+          const ids = [...stickerDeleteApprovals.keys()];
+          if (!ids.length) { await sendToQQ(key, '当前没有待审批的删除请求。'); return; }
+          const done = [];
+          const errs = [];
+          for (const id of ids) {
+            const a = stickerDeleteApprovals.get(id);
+            if (!a) continue;
+            if (!isApprove) { stickerDeleteApprovals.delete(id); done.push(...a.items); continue; }
+            try { const r = await executeStickerDeleteV2(id); done.push(...r.done); if (r.failed.length) errs.push(...r.failed); }
+            catch (error) { errs.push(...a.items.map((it) => ({ ...it, error: error?.message ?? String(error) }))); }
+          }
+          const lines = [`已${verb} ${done.length} 张：${done.length ? describeDeleteItems(done) : '无'}`];
+          if (errs.length) lines.push(`失败 ${errs.length} 张：${errs.map((f) => `#${f.stickerId} ${f.error}`).join('；')}`);
+          log(`[sticker] 批量审批（${verb}）${done.length} 张${errs.length ? `，失败 ${errs.length} 张` : ''}`);
+          await sendToQQ(key, lines.join('\n'));
+          return;
+        }
+        // 无 id：唯一在途单自动命中
+        if (!arg) {
+          const ids = [...stickerDeleteApprovals.keys()];
+          if (ids.length === 0) { await sendToQQ(key, '当前没有待审批的删除请求。'); return; }
+          if (ids.length > 1) {
+            await sendToQQ(key, `有 ${ids.length} 个待审批单（${ids.join('、')}）。回复 /approve all 全部同意、/reject all 全部拒绝，或 /${isApprove ? 'approve' : 'reject'} <单号> 单个处理。`);
+            return;
+          }
+          arg = ids[0];
+        }
+        // 容错：用户可能把审批卡里的表情 id 当成了审批单号——按表情 id 再查一次
+        let entry = stickerDeleteApprovals.get(arg);
+        if (!entry) {
+          for (const [aid, a] of stickerDeleteApprovals) {
+            if (a.items.some((it) => it.stickerId === arg)) { arg = aid; entry = a; break; }
+          }
+        }
+        if (!entry) {
+          await sendToQQ(key, `审批单 ${arg} 不存在或已过期。审批单号是审批卡里的 6 位字符（形如 /approve a1b2c3），不是表情 id；只有一张待审时直接回 /approve 即可。`);
+          return;
+        }
+        if (!isApprove) {
+          stickerDeleteApprovals.delete(arg);
+          log(`[sticker] 删除审批 ${arg} 已被管理员拒绝（${entry.items.length} 张表情保留）`);
+          await sendToQQ(key, `已拒绝删除 ${describeDeleteItems(entry.items)}。`);
+          return;
+        }
+        try {
+          const result = await executeStickerDeleteV2(arg);
+          log(`[sticker] 删除审批 ${arg} 已通过：${result.done.length} 张已从 QQ 收藏与本地库移除${result.failed.length ? `，失败 ${result.failed.length} 张` : ''}`);
+          const lines = [`已删除 ${describeDeleteItems(result.done)}。`];
+          if (result.failed.length) lines.push(`失败 ${result.failed.length} 张：${result.failed.map((f) => `#${f.stickerId} ${f.error}`).join('；')}`);
+          await sendToQQ(key, lines.join('\n'));
+        } catch (error) {
+          await sendToQQ(key, `删除失败：${error?.message ?? error}（审批单未消费，有效期内修复问题后重发 /approve ${arg} 可重试）`);
+        }
         return;
       }
       if (plainContent === '/role' || plainContent.startsWith('/role ')) {

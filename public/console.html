@@ -2049,6 +2049,7 @@ button:active:not(:disabled) {
         <label class="v2-tool-item"><input type="checkbox" data-v2-tool="getSelfImage"> <span><b>qq_get_self_image</b><span class="meta">查看自己的默认 Q 版形象图片</span></span></label>
         <label class="v2-tool-item"><input type="checkbox" data-v2-tool="stickerNote"> <span><b>qq_sticker_note</b><span class="meta">给表情记录本地含义/标签/用法</span></span></label>
         <label class="v2-tool-item"><input type="checkbox" data-v2-tool="setStickerRemark"> <span><b>qq_set_sticker_remark</b><span class="meta">修改 QQ 官方表情备注（默认禁用，慎用）</span></span></label>
+        <label class="v2-tool-item"><input type="checkbox" data-v2-tool="deleteSticker"> <span><b>qq_delete_sticker</b><span class="meta">删除收藏表情（默认禁用；AI 一次可提交多张，私聊一张审批卡，/approve 一次整批删）</span></span></label>
         <label class="v2-tool-item"><input type="checkbox" data-v2-tool="sendVoice"> <span><b>qq_send_voice / qq_list_voices</b><span class="meta">发送语音条（只能发语音库里的音频；偶然而为的强表达）</span></span></label>
       </div>
       <div class="meta" style="margin-top:6px">二代黑话学习：AI 可用 <code>qq_slang_submit</code> 提交陌生词，也可由桥接自动提取；管理员在「黑话词库」页面筛选确认后，词条会自动写入黑话提示词并注入 <code>qq_get_prompt</code> 与后续唤醒。</div>
@@ -2204,6 +2205,26 @@ button:active:not(:disabled) {
       <div class="row">
         <label style="flex:1">收藏备注最大字数</label><input type="number" id="v2StickerCollectRemarkMax" min="1" max="50" style="width:80px">
         <span class="meta" style="flex:2">AI 收藏别人表情时写的简短备注长度上限。</span>
+      </div>
+      <div class="row">
+        <label style="flex:1">删除表情自动批准</label><input type="checkbox" id="v2StickerDeleteAuto" style="width:auto">
+        <label style="flex:1">自动批准每日上限</label><input type="number" id="v2StickerDeleteAutoLimit" min="0" max="200" style="width:80px">
+        <span class="meta" style="flex:2">开启后 AI 的删除请求直接执行，不再私聊等你 <code>/approve</code>（仍会通知删了哪些）；超过每日上限退回人工审批。需同时开启 <code>qq_delete_sticker</code> 工具。管理员也可在 QQ 里用 <code>/stickerauto on|off</code>、<code>/stickerauto limit 50</code> 控制。</span>
+      </div>
+
+      </div></details>
+<details class="settings-group"><summary>时段静默（quietHours：到点丢弃唤醒）</summary><div class="settings-content">
+      <div class="row">
+        <label style="flex:1">启用时段静默</label><input type="checkbox" id="v2QuietEnabled" style="width:auto">
+        <label style="flex:1">生效范围</label>
+        <select id="v2QuietScope" style="width:140px">
+          <option value="all">群聊+私聊</option>
+          <option value="groups">仅群聊</option>
+        </select>
+      </div>
+      <div class="row">
+        <label style="flex:1">静默时段</label><input type="text" id="v2QuietRanges" placeholder="23:30-07:00, 12:00-13:30" style="width:260px">
+        <span class="meta" style="flex:2">本地时间，多段逗号分隔，支持跨零点；起止相同会被忽略。时段内唤醒直接丢弃（不暂存、不补发），消息照收。管理员也可在 QQ 里用 /quiet on|off、/quiet groups|all、/quiet 23:30-07:00 控制。</span>
       </div>
 
       </div></details>
@@ -2448,6 +2469,13 @@ button:active:not(:disabled) {
       <input type="text" id="dnGroups" placeholder="">
       <label>拒绝的私聊 QQ（黑名单，逗号分隔）</label>
       <input type="text" id="dnPrivate" placeholder="">
+      <label>未授权会话日志</label>
+      <select id="unauthorizedLog">
+        <option value="throttle">汇总（每 10 分钟一条，默认）</option>
+        <option value="on">每条都显示</option>
+        <option value="off">完全静默</option>
+      </select>
+      <div class="meta">不在白名单 / 当前模式不允许的群或私聊发消息时打什么日志。陌生群刷屏时用「汇总」或「静默」可避免日志污染；排查加白名单问题时切「每条都显示」。</div>
       <div class="row" style="margin-top:10px">
         <button id="wlSave">保存白名单</button>
         <span class="meta">保存后立即生效并写入 config.json</span>
@@ -2986,6 +3014,7 @@ async function refreshWhitelist() {
     document.getElementById('ownerQQ').value = w.ownerQQ != null ? String(w.ownerQQ) : '';
     document.getElementById('dnGroups').value = (w.deny.groups || []).join(', ');
     document.getElementById('dnPrivate').value = (w.deny.private || []).join(', ');
+    document.getElementById('unauthorizedLog').value = w.unauthorizedLog || 'throttle';
   } catch {}
 }
 
@@ -3159,7 +3188,8 @@ document.getElementById('wlSave').addEventListener('click', async () => {
   const r = await api('/api/whitelist', 'POST', {
     allow: { private: parse(document.getElementById('wlPrivate').value), groups: parse(document.getElementById('wlGroups').value) },
     deny: { private: parse(document.getElementById('dnPrivate').value), groups: parse(document.getElementById('dnGroups').value) },
-    ownerQQ: document.getElementById('ownerQQ').value.trim()
+    ownerQQ: document.getElementById('ownerQQ').value.trim(),
+    unauthorizedLog: document.getElementById('unauthorizedLog').value
   });
   if (r.ok) { refreshWhitelist(); refresh(); alert('白名单已保存并生效'); }
   else alert(r.error || '保存失败');
@@ -3333,6 +3363,13 @@ async function loadV2Config() {
     document.getElementById('v2StickerCollectPerMin').value = stkCollect.maxPerMinute ?? 2;
     document.getElementById('v2StickerCollectPerHour').value = stkCollect.maxPerHour ?? 10;
     document.getElementById('v2StickerCollectRemarkMax').value = stkCollect.maxRemarkChars ?? 20;
+    const stkDel = stk.deleteApprove || {};
+    document.getElementById('v2StickerDeleteAuto').checked = stkDel.auto === true;
+    document.getElementById('v2StickerDeleteAutoLimit').value = stkDel.dailyLimit ?? 20;
+    const qh = c.quietHours || {};
+    document.getElementById('v2QuietEnabled').checked = qh.enabled === true;
+    document.getElementById('v2QuietScope').value = qh.scope === 'groups' ? 'groups' : 'all';
+    document.getElementById('v2QuietRanges').value = (Array.isArray(qh.ranges) ? qh.ranges : []).map((r) => r.join('-')).join(', ');
     const ctx = c.context || {};
     document.getElementById('v2ContextRecentLimit').value = ctx.recentLimit ?? 100;
     document.getElementById('v2ContextUnreadLimit').value = ctx.unreadLimit ?? 30;
@@ -3415,7 +3452,19 @@ async function saveV2Config() {
         maxPerMinute: Math.max(0, Math.round(Number(document.getElementById('v2StickerCollectPerMin').value) || 0)),
         maxPerHour: Math.max(0, Math.round(Number(document.getElementById('v2StickerCollectPerHour').value) || 0)),
         maxRemarkChars: Math.min(50, Math.max(1, Math.round(Number(document.getElementById('v2StickerCollectRemarkMax').value) || 20)))
+      },
+      deleteApprove: {
+        auto: document.getElementById('v2StickerDeleteAuto').checked,
+        dailyLimit: Math.min(200, Math.max(0, Math.round(Number(document.getElementById('v2StickerDeleteAutoLimit').value) || 0)))
       }
+    },
+    quietHours: {
+      enabled: document.getElementById('v2QuietEnabled').checked,
+      scope: document.getElementById('v2QuietScope').value === 'groups' ? 'groups' : 'all',
+      ranges: document.getElementById('v2QuietRanges').value.split(/[，,]/).map((s) => s.trim()).filter(Boolean).map((s) => {
+        const m = /^(\d{1,2}:\d{2})\s*[-~—]\s*(\d{1,2}:\d{2})$/.exec(s);
+        return m ? [m[1], m[2]] : null;
+      }).filter(Boolean)
     },
     context: {
       recentLimit: Math.round(Number(document.getElementById('v2ContextRecentLimit').value) || 100),

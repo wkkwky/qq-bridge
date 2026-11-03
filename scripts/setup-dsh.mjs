@@ -12,7 +12,9 @@
 // 用法：
 //   node scripts/setup-dsh.mjs [profile]
 //
-// 默认 profile 为 web；可用环境变量 DSH_HOME 指定 DSH 根目录。
+//   不传参数 = 自动扫描 ~/.dsh/profiles/ 下所有子目录并逐一安装（web、desktop 都会覆盖到）。
+//   传参 = 只装指定 profile（向后兼容）。
+//   可用环境变量 DSH_HOME 指定 DSH 根目录。
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
@@ -24,21 +26,37 @@ import { BUNDLE_DIR, PRESETS, buildPatches, patchFileFor } from './build-agent-p
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, '..');
 const DSH_HOME = process.env.DSH_HOME || path.join(os.homedir(), '.dsh');
-const PROFILE = process.argv[2] || 'web';
+/** 显式传参 = 单 profile；不传 = 扫 ~/.dsh/profiles/ 下所有子目录。 */
+const EXPLICIT_PROFILE = process.argv[2];
 
-// A profile is a directory name, never a path (same boundary as DSH itself).
-if (PROFILE === '.' || PROFILE === '..' || PROFILE === 'node_modules'
-    || /[\\/\x00-\x1f<>:"|?*]/.test(PROFILE) || /[. ]$/.test(PROFILE)) {
-  fatal(`invalid profile name: ${JSON.stringify(PROFILE)}`);
+function listProfiles() {
+  const dir = path.join(DSH_HOME, 'profiles');
+  if (!fs.existsSync(dir)) return [];
+  return fs.readdirSync(dir, { withFileTypes: true })
+    .filter((e) => e.isDirectory() && !e.name.startsWith('.') && e.name !== 'node_modules')
+    .map((e) => e.name);
 }
+
+function validateProfile(name) {
+  if (name === '.' || name === '..' || name === 'node_modules'
+      || /[\\/\x00-\x1f<>:"|?*]/.test(name) || /[. ]$/.test(name)) {
+    fatal(`invalid profile name: ${JSON.stringify(name)}`);
+  }
+}
+
+const TARGET_PROFILES = EXPLICIT_PROFILE ? [EXPLICIT_PROFILE] : listProfiles();
+if (TARGET_PROFILES.length === 0) {
+  fatal(`no DSH profiles found under ${path.join(DSH_HOME, 'profiles')}；要么先启动一次 DSH 让它建 profile 目录，要么手动传 profile 名`);
+}
+for (const p of TARGET_PROFILES) validateProfile(p);
+if (!EXPLICIT_PROFILE) log(`自动发现 ${TARGET_PROFILES.length} 个 profile: ${TARGET_PROFILES.join(', ')}`);
 
 function log(msg) {
   console.log(`[setup-dsh] ${msg}`);
 }
 
 function fatal(msg) {
-  console.error(`[setup-dsh] ERROR: ${msg}`);
-  process.exit(1);
+  throw new Error(`[setup-dsh] FATAL: ${msg}`);
 }
 
 function ensureDir(p) {
@@ -123,7 +141,8 @@ function yamlSingleQuote(s) {
 }
 
 // 由桥接托管的 MCP 条目 id：脚本对这三个 id 拥有所有权，可安全地按 id 增删。
-const MANAGED_MCP_IDS = ['mcp-snowluma', 'mcp-snowluma-host', 'mcp-web-search-safe'];
+const MANAGED_MCP_IDS = [
+  'mcp-sing','mcp-snowluma', 'mcp-snowluma-host', 'mcp-web-search-safe'];
 
 function mcpEntries() {
   const node = process.execPath;
@@ -151,7 +170,7 @@ function mcpEntries() {
   return out;
 }
 
-function prepareCordisPatch() {
+function prepareCordisPatch(PROFILE) {
   const profileDir = path.join(DSH_HOME, 'profiles', PROFILE);
   const patchFile = path.join(profileDir, 'cordis.patch.yml');
   const original = fs.existsSync(patchFile) ? fs.readFileSync(patchFile, 'utf8') : '';
@@ -262,14 +281,14 @@ function ensureDirLink(linkPath, targetDir, label) {
  * 第二层必须自己建：preset 子行按 profile 目录解析裸说明符
  * （qq-agent-presets/qq-tool-restrict.mjs），缺了它 preset 会整条挂载失败。
  */
-function ensureBundle(name) {
+function ensureBundle(name, PROFILE) {
   const repoDir = name === 'qq-agent-presets' ? BUNDLE_DIR : path.join(REPO_ROOT, 'plugins', name);
   const linkDir = ensureDirLink(path.join(DSH_HOME, 'plugins', name), repoDir, `bundle ${name} link`);
   ensureDirLink(path.join(DSH_HOME, 'profiles', PROFILE, 'node_modules', name), linkDir, `bundle ${name} node_modules link`);
   return linkDir;
 }
 
-function patchProfilePackage(links) {
+function patchProfilePackage(links, PROFILE) {
   const profileDir = path.join(DSH_HOME, 'profiles', PROFILE);
   const pkgFile = path.join(profileDir, 'package.json');
   ensureDir(profileDir);
@@ -319,7 +338,7 @@ function ensureLocalModeFile() {
 // qq-mode-console / qq-agent-presets 以 link: 依赖注册进 profile package.json 后，DSH 首次启动
 // 需要先安装一次才能解析这些 bundle（否则 cold start 报 "cannot resolve profile bundle"）。
 // dsh CLI 可用时自动执行。
-function autoInstallProfileBundles() {
+function autoInstallProfileBundles(PROFILE) {
   if (process.env.QQ_BRIDGE_SKIP_DSH_INSTALL === '1') {
     log('auto-install skipped: QQ_BRIDGE_SKIP_DSH_INSTALL=1');
     return;
@@ -351,14 +370,32 @@ function autoInstallProfileBundles() {
   }
 }
 
-// Validate the existing YAML before changing any presets or configuration.
-const cordisPatch = prepareCordisPatch();
+// profile 无关 —— 全量跑一次
 regeneratePresetPatches();
-patchCordis(cordisPatch);
-const links = {};
-for (const name of BUNDLE_NAMES) links[name] = ensureBundle(name);
-patchProfilePackage(links);
 reportLegacyPresetDir();
 ensureLocalModeFile();
-autoInstallProfileBundles();
-log('Done. Restart DSH (or reload the profile) so the new presets/MCP take effect.');
+
+// profile 相关 —— 逐个循环；单个失败不影响其他
+let failed = 0;
+for (const PROFILE of TARGET_PROFILES) {
+  try {
+    log(`── 安装到 profile "${PROFILE}" ──`);
+    const cordisPatch = prepareCordisPatch(PROFILE);
+    patchCordis(cordisPatch);
+    const links = {};
+    for (const name of BUNDLE_NAMES) links[name] = ensureBundle(name, PROFILE);
+    patchProfilePackage(links, PROFILE);
+    autoInstallProfileBundles(PROFILE);
+    log(`profile "${PROFILE}" 完成`);
+  } catch (err) {
+    failed++;
+    console.error(`[setup-dsh] profile "${PROFILE}" 失败: ${err.message}`);
+  }
+}
+
+if (failed > 0) {
+  console.error(`[setup-dsh] 有 ${failed}/${TARGET_PROFILES.length} 个 profile 安装失败，请检查上方错误`);
+  process.exitCode = 1;
+} else {
+  log(`全部完成（${TARGET_PROFILES.length} 个 profile）。重启 DSH（或 reload profile）让新 preset/MCP 生效。`);
+}
